@@ -46,88 +46,149 @@ async def detect_images_in_response(page: Page) -> list[dict]:
     """
     result = await page.evaluate("""
         () => {
-            const articles = document.querySelectorAll('article');
-            if (articles.length === 0) return [];
-
-            const lastTurn = articles[articles.length - 1];
-
-            // Find generated images — primary: alt="Generated image"
-            let images = lastTurn.querySelectorAll('img[alt="Generated image"]');
-
-            // Fallback: images inside imagegen containers
-            if (images.length === 0) {
-                const containers = lastTurn.querySelectorAll('div[id^="image-"]');
-                if (containers.length > 0) {
-                    const imgSet = new Set();
-                    for (const c of containers) {
-                        const imgs = c.querySelectorAll('img');
-                        for (const img of imgs) imgSet.add(img);
-                    }
-                    images = [...imgSet];
-                }
-            }
-
-            // Fallback: any large image from chatgpt backend
-            if (images.length === 0) {
-                const allImgs = lastTurn.querySelectorAll('img');
-                const large = [];
-                for (const img of allImgs) {
-                    const w = img.naturalWidth || img.width || 0;
-                    const src = img.src || '';
-                    if (w > 200 && (
-                        src.includes('backend-api/estuary') ||
-                        src.includes('chatgpt.com')
-                    )) {
-                        large.push(img);
-                    }
-                }
-                images = large;
-            }
-
-            if (!images || images.length === 0) return [];
-
-            // Deduplicate by src URL
-            const seen = new Set();
-            const results = [];
-
-            for (const img of images) {
-                const src = img.src || '';
-                if (!src || seen.has(src)) continue;
-                seen.add(src);
-
-                const alt = img.alt || '';
-
-                // Extract the image title from nearby text in the turn
-                // ChatGPT shows "Creating image • Image Title" in a button/span
+            const buildTitle = (root) => {
                 let title = '';
-                const buttons = lastTurn.querySelectorAll('button');
-                for (const btn of buttons) {
+
+                for (const btn of root.querySelectorAll('button')) {
                     const text = (btn.innerText || '').trim();
-                    // Parse "Creating image • Title" or just "Title"
                     const bulletIdx = text.indexOf('•');
-                    if (bulletIdx > -1) {
+                    if (bulletIdx > -1 && bulletIdx < text.length - 1) {
                         title = text.substring(bulletIdx + 1).trim();
                         break;
                     }
                 }
-                // Fallback: look for text spans in the turn
+
                 if (!title) {
-                    const spans = lastTurn.querySelectorAll(
-                        'span.text-token-text-tertiary'
-                    );
-                    for (const span of spans) {
-                        const t = (span.innerText || '').trim();
-                        if (t.length > 5 && t.length < 200) {
-                            title = t;
+                    const lines = (root.innerText || '')
+                        .split('\\n')
+                        .map((line) => line.trim())
+                        .filter(Boolean);
+                    const ignored = new Set([
+                        'Image created',
+                        'Creating image',
+                        'Share',
+                        'Edit',
+                        'Save',
+                        'Download',
+                    ]);
+                    for (const line of lines) {
+                        if (line.length > 5 && line.length < 200 && !ignored.has(line)) {
+                            title = line;
                             break;
                         }
                     }
                 }
 
-                results.push({ url: src, alt, title });
+                return title;
+            };
+
+            const collectImages = (root) => {
+                const results = [];
+                const seen = new Set();
+                const title = buildTitle(root);
+                const hasDownloadControl = !!root.querySelector(
+                    'button[aria-label*="Download"], a[aria-label*="Download"], a[download]'
+                );
+
+                for (const img of root.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src || '';
+                    const alt = img.alt || '';
+                    const ariaHidden = (img.getAttribute('aria-hidden') || '').toLowerCase();
+                    const rect = img.getBoundingClientRect();
+                    const w = img.naturalWidth || img.width || rect.width || 0;
+                    const h = img.naturalHeight || img.height || rect.height || 0;
+                    const visible = rect.width > 24 && rect.height > 24;
+                    const largeEnough = w >= 180 || h >= 180 || rect.width >= 180 || rect.height >= 180;
+                    const looksLikeUiIcon =
+                        alt.toLowerCase().includes('avatar') ||
+                        alt.toLowerCase().includes('icon') ||
+                        src.includes('avatar') ||
+                        src.startsWith('data:image/svg');
+
+                    if (!visible || !largeEnough || looksLikeUiIcon || ariaHidden === 'true') {
+                        continue;
+                    }
+
+                    let normalizedSrc = src;
+                    if (src) {
+                        try {
+                            const url = new URL(src);
+                            normalizedSrc = `${url.origin}${url.pathname}|${url.searchParams.get('id') || ''}`;
+                        } catch (_) {
+                            normalizedSrc = src.split('?')[0];
+                        }
+                    }
+
+                    const key = normalizedSrc || `${Math.round(rect.width)}x${Math.round(rect.height)}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+
+                    if (
+                        hasDownloadControl ||
+                        src.startsWith('blob:') ||
+                        src.includes('backend-api') ||
+                        src.includes('openai') ||
+                        src.includes('oaidalle') ||
+                        src.includes('files.oaiusercontent.com') ||
+                        alt.toLowerCase().includes('generated') ||
+                        (root.innerText || '').includes('Image created')
+                    ) {
+                        results.push({ url: src, alt, title });
+                        continue;
+                    }
+
+                    results.push({ url: src, alt, title });
+                }
+
+                return results;
+            };
+
+            const agentTurns = Array.from(document.querySelectorAll('.agent-turn'));
+            if (agentTurns.length > 0) {
+                const fromAgentTurn = collectImages(agentTurns[agentTurns.length - 1]);
+                if (fromAgentTurn.length > 0) {
+                    return fromAgentTurn;
+                }
             }
 
-            return results;
+            const articles = Array.from(document.querySelectorAll('article'));
+            if (articles.length === 0) {
+                return collectImages(document.body);
+            }
+
+            const isAssistantLikeTurn = (article) => {
+                if (article.querySelector('[data-message-author-role="assistant"], .agent-turn')) {
+                    return true;
+                }
+
+                const text = (article.innerText || '').toLowerCase();
+                if (
+                    text.includes('image created') ||
+                    text.includes('creating image') ||
+                    text.includes('generated image')
+                ) {
+                    return true;
+                }
+
+                return !!article.querySelector(
+                    'button[aria-label*="Download"], a[aria-label*="Download"], a[download]'
+                );
+            };
+
+            let lastTurn = null;
+            for (let i = articles.length - 1; i >= 0; i--) {
+                if (isAssistantLikeTurn(articles[i])) {
+                    lastTurn = articles[i];
+                    break;
+                }
+            }
+            if (!lastTurn) lastTurn = articles[articles.length - 1];
+            const fromLastTurn = collectImages(lastTurn);
+            if (fromLastTurn.length > 0) {
+                return fromLastTurn;
+            }
+
+            return collectImages(document.body);
         }
     """)
 

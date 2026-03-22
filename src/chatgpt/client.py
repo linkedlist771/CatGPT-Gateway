@@ -219,9 +219,15 @@ class ChatGPTClient:
         """
         text = await self._page.evaluate("""
             () => {
-                const articles = document.querySelectorAll('article');
-                if (articles.length === 0) return '';
-                const last = articles[articles.length - 1];
+                const agentTurns = document.querySelectorAll('.agent-turn');
+                let last = null;
+                if (agentTurns.length > 0) {
+                    last = agentTurns[agentTurns.length - 1];
+                } else {
+                    const articles = document.querySelectorAll('article');
+                    if (articles.length === 0) return '';
+                    last = articles[articles.length - 1];
+                }
 
                 // Try to get descriptive text (not "ChatGPT said:" heading)
                 const spans = last.querySelectorAll('span');

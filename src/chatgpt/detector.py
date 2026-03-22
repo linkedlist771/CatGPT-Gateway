@@ -68,29 +68,128 @@ async def _detect_image_in_latest_turn(page: Page) -> bool:
     """
     return await page.evaluate("""
         () => {
-            const articles = document.querySelectorAll('article');
-            if (articles.length === 0) return false;
-            const last = articles[articles.length - 1];
+            const agentTurns = Array.from(document.querySelectorAll('.agent-turn'));
+            if (agentTurns.length > 0) {
+                const turn = agentTurns[agentTurns.length - 1];
+                for (const img of turn.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src || '';
+                    const alt = (img.alt || '').toLowerCase();
+                    const rect = img.getBoundingClientRect();
+                    const w = img.naturalWidth || img.width || rect.width || 0;
+                    const h = img.naturalHeight || img.height || rect.height || 0;
+                    const visible = rect.width > 24 && rect.height > 24;
+                    const largeEnough = w >= 180 || h >= 180 || rect.width >= 180 || rect.height >= 180;
+                    if (!visible || !largeEnough) continue;
+                    if (
+                        src.startsWith('blob:') ||
+                        src.includes('backend-api') ||
+                        src.includes('openai') ||
+                        src.includes('oaidalle') ||
+                        alt.includes('generated image')
+                    ) {
+                        return true;
+                    }
+                }
+            }
 
-            // Check for generated images
-            const imgs = last.querySelectorAll('img[alt="Generated image"]');
-            if (imgs.length > 0) return true;
+            const articles = Array.from(document.querySelectorAll('article'));
+            if (articles.length === 0) {
+                for (const img of document.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src || '';
+                    const alt = (img.alt || '').toLowerCase();
+                    const rect = img.getBoundingClientRect();
+                    const w = img.naturalWidth || img.width || rect.width || 0;
+                    const h = img.naturalHeight || img.height || rect.height || 0;
+                    const visible = rect.width > 24 && rect.height > 24;
+                    const largeEnough = w >= 180 || h >= 180 || rect.width >= 180 || rect.height >= 180;
+                    const looksLikeUiIcon =
+                        alt.includes('avatar') ||
+                        alt.includes('icon') ||
+                        src.includes('avatar') ||
+                        src.startsWith('data:image/svg');
+                    if (!visible || !largeEnough || looksLikeUiIcon) continue;
+                    if (
+                        src.includes('backend-api') ||
+                        src.includes('openai') ||
+                        src.includes('oaidalle') ||
+                        alt.includes('generated image')
+                    ) {
+                        return true;
+                    }
+                }
+                return false;
+            }
 
-            // Check for image containers
-            const containers = last.querySelectorAll('div[id^="image-"]');
-            if (containers.length > 0) return true;
-
-            // Check for large images from chatgpt backend
-            const allImgs = last.querySelectorAll('img');
-            for (const img of allImgs) {
-                const w = img.naturalWidth || img.width || 0;
-                const src = img.src || '';
-                if (w > 200 && (
-                    src.includes('backend-api/estuary') ||
-                    src.includes('chatgpt.com') && w > 500
-                )) {
+            const isAssistantLikeTurn = (article) => {
+                if (article.querySelector('[data-message-author-role="assistant"], .agent-turn')) {
                     return true;
                 }
+
+                const text = (article.innerText || '').toLowerCase();
+                if (
+                    text.includes('image created') ||
+                    text.includes('creating image') ||
+                    text.includes('generated image')
+                ) {
+                    return true;
+                }
+
+                if (
+                    article.querySelector(
+                        'button[aria-label*="Download"], a[aria-label*="Download"], a[download]'
+                    )
+                ) {
+                    return true;
+                }
+
+                return false;
+            };
+
+            let turn = null;
+            for (let i = articles.length - 1; i >= 0; i--) {
+                if (isAssistantLikeTurn(articles[i])) {
+                    turn = articles[i];
+                    break;
+                }
+            }
+            if (!turn) turn = articles[articles.length - 1];
+
+            const hasDownloadControl = !!turn.querySelector(
+                'button[aria-label*="Download"], a[aria-label*="Download"], a[download]'
+            );
+
+            for (const img of turn.querySelectorAll('img')) {
+                const src = img.currentSrc || img.src || '';
+                const alt = (img.alt || '').toLowerCase();
+                const rect = img.getBoundingClientRect();
+                const w = img.naturalWidth || img.width || rect.width || 0;
+                const h = img.naturalHeight || img.height || rect.height || 0;
+                const visible = rect.width > 24 && rect.height > 24;
+                const largeEnough = w >= 180 || h >= 180 || rect.width >= 180 || rect.height >= 180;
+                const looksLikeUiIcon =
+                    alt.includes('avatar') ||
+                    alt.includes('icon') ||
+                    src.includes('avatar') ||
+                    src.startsWith('data:image/svg');
+
+                if (!visible || !largeEnough || looksLikeUiIcon) {
+                    continue;
+                }
+
+                if (
+                    hasDownloadControl ||
+                    src.startsWith('blob:') ||
+                    src.includes('backend-api') ||
+                    src.includes('openai') ||
+                    src.includes('oaidalle') ||
+                    src.includes('files.oaiusercontent.com') ||
+                    alt.includes('generated')
+                ) {
+                    return true;
+                }
+
+                // Newer ChatGPT UIs may render a plain large image with no stable alt/src markers.
+                return true;
             }
 
             return false;
